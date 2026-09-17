@@ -205,6 +205,13 @@ func (f Font) getEncoder() TextEncoding {
 	toUnicode := f.V.Key("ToUnicode")
 	if toUnicode.Kind() == Stream {
 		if m := readCmap(toUnicode); m != nil {
+			if f.V.Key("Subtype").Name() != "Type0" {
+				// A simple font's codes are one byte each whatever codespace
+				// its CMap declares, and codes the CMap leaves out still mean
+				// what the font's Encoding says (the same rules poppler applies).
+				m.singleByte = true
+				m.fallback = f.encodingEncoder()
+			}
 			return m
 		}
 		// ToUnicode stream exists but failed to parse - fall through to Encoding
@@ -212,8 +219,11 @@ func (f Font) getEncoder() TextEncoding {
 			println("ToUnicode stream failed to parse, falling back to Encoding")
 		}
 	}
+	return f.encodingEncoder()
+}
 
-	// Fall back to Encoding-based decoding
+// encodingEncoder decodes through the font's /Encoding entry alone.
+func (f Font) encodingEncoder() TextEncoding {
 	enc := f.V.Key("Encoding")
 	switch enc.Kind() {
 	case Name:
@@ -349,10 +359,31 @@ type cmap struct {
 	space   [4][]byteRange // codespace range
 	bfrange []bfrange
 	bfchar  []bfchar
+
+	// singleByte decodes one byte per code and ignores the codespace ranges.
+	// Simple fonts always use one-byte codes (PDF 32000-1 §9.6.6), but Acrobat
+	// writes their ToUnicode CMaps with a <0000>-<FFFF> codespace over one-byte
+	// bfchar entries; honouring that codespace swallows two codes per glyph.
+	singleByte bool
+	// fallback decodes codes the CMap does not map (nil means U+FFFD).
+	fallback TextEncoding
 }
 
 func (m *cmap) Decode(raw string) (text string) {
 	var r []rune
+	if m.singleByte {
+		for i := 0; i < len(raw); i++ {
+			code := raw[i : i+1]
+			if mapped, ok := m.lookup(code); ok {
+				r = append(r, mapped...)
+			} else if m.fallback != nil {
+				r = append(r, []rune(m.fallback.Decode(code))...)
+			} else {
+				r = append(r, noRune)
+			}
+		}
+		return string(r)
+	}
 Parse:
 	for len(raw) > 0 {
 		for n := 1; n <= 4 && n <= len(raw); n++ { // number of digits in character replacement (1-4 possible)
@@ -360,45 +391,11 @@ Parse:
 				if space.low <= raw[:n] && raw[:n] <= space.high { // see if value is in range
 					text := raw[:n]
 					raw = raw[n:]
-					for _, bfchar := range m.bfchar { // check for matching bfchar
-						if len(bfchar.orig) == n && bfchar.orig == text {
-							r = append(r, []rune(utf16Decode(bfchar.repl))...)
-							continue Parse
-						}
+					if mapped, ok := m.lookup(text); ok {
+						r = append(r, mapped...)
+					} else {
+						r = append(r, noRune)
 					}
-					for _, bfrange := range m.bfrange { // check for matching bfrange
-						if len(bfrange.lo) == n && bfrange.lo <= text && text <= bfrange.hi {
-							if bfrange.dst.Kind() == String {
-								s := bfrange.dst.RawString()
-								if bfrange.lo != text { // value isn't at the beginning of the range so scale result
-									b := []byte(s)
-									b[len(b)-1] += text[len(text)-1] - bfrange.lo[len(bfrange.lo)-1] // increment last byte by difference
-									s = string(b)
-								}
-								r = append(r, []rune(utf16Decode(s))...)
-								continue Parse
-							}
-							if bfrange.dst.Kind() == Array {
-								n := text[len(text)-1] - bfrange.lo[len(bfrange.lo)-1]
-								v := bfrange.dst.Index(int(n))
-								if v.Kind() == String {
-									s := v.RawString()
-									r = append(r, []rune(utf16Decode(s))...)
-									continue Parse
-								}
-								if DebugOn {
-									fmt.Printf("array %v\n", bfrange.dst)
-								}
-							} else {
-								if DebugOn {
-									fmt.Printf("unknown dst %v\n", bfrange.dst)
-								}
-							}
-							r = append(r, noRune)
-							continue Parse
-						}
-					}
-					r = append(r, noRune)
 					continue Parse
 				}
 			}
@@ -410,6 +407,45 @@ Parse:
 		raw = raw[1:]
 	}
 	return string(r)
+}
+
+// lookup resolves one code of len(text) bytes through the bfchar and bfrange
+// entries of the same length.
+func (m *cmap) lookup(text string) ([]rune, bool) {
+	n := len(text)
+	for _, bfchar := range m.bfchar { // check for matching bfchar
+		if len(bfchar.orig) == n && bfchar.orig == text {
+			return []rune(utf16Decode(bfchar.repl)), true
+		}
+	}
+	for _, bfrange := range m.bfrange { // check for matching bfrange
+		if len(bfrange.lo) != n || text < bfrange.lo || bfrange.hi < text {
+			continue
+		}
+		if bfrange.dst.Kind() == String {
+			s := bfrange.dst.RawString()
+			if bfrange.lo != text { // value isn't at the beginning of the range so scale result
+				b := []byte(s)
+				b[len(b)-1] += text[len(text)-1] - bfrange.lo[len(bfrange.lo)-1] // increment last byte by difference
+				s = string(b)
+			}
+			return []rune(utf16Decode(s)), true
+		}
+		if bfrange.dst.Kind() == Array {
+			idx := text[len(text)-1] - bfrange.lo[len(bfrange.lo)-1]
+			v := bfrange.dst.Index(int(idx))
+			if v.Kind() == String {
+				return []rune(utf16Decode(v.RawString())), true
+			}
+			if DebugOn {
+				fmt.Printf("array %v\n", bfrange.dst)
+			}
+		} else if DebugOn {
+			fmt.Printf("unknown dst %v\n", bfrange.dst)
+		}
+		return nil, false
+	}
+	return nil, false
 }
 
 func readCmap(toUnicode Value) *cmap {
